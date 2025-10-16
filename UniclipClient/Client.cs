@@ -1,20 +1,21 @@
-using System.Net;
 using System.Net.WebSockets;
 using System.Text;
+using UniclipClient.Helpers;
 using Timer = System.Windows.Forms.Timer;
 
 namespace UniclipClient
 {
     public partial class Client : Form
     {
-        private NotifyIcon trayIcon;
-        private ContextMenuStrip trayMenu;
-        private ClientWebSocket ws;
+        private NotifyIcon? trayIcon;
+        private ContextMenuStrip? trayMenu;
+        private ClientWebSocket? ws;
         private bool isReceiving = false;
         private bool isConnected = false;
-        private Timer clipboardTimer;
+        private Timer? clipboardTimer;
         private string lastClipboardText = "";
         private readonly CancellationTokenSource cts = new();
+        private static string _roomSecretCode = string.Empty;
 
         public Client()
         {
@@ -22,109 +23,30 @@ namespace UniclipClient
             InitializeTray();
         }
 
-        private void InitializeTray()
-        {
-            trayMenu = new ContextMenuStrip();
-            trayMenu.Items.Add("Open Connection", null, OnOpenConnection);
-            trayMenu.Items.Add("Connect to Code", null, OnConnect);
-            trayMenu.Items.Add("Close Connection", null, OnCloseConnection);
-            trayMenu.Items.Add("Exit", null, OnExit);
-
-            trayIcon = new NotifyIcon
-            {
-                Text = "Uniclip",
-                Icon = SystemIcons.Application,
-                ContextMenuStrip = trayMenu,
-                Visible = true
-            };
-
-            WindowState = FormWindowState.Minimized;
-            ShowInTaskbar = false;
-            Load += (s, e) => Hide();
-        }
-
-        private async void OnOpenConnection(object sender, EventArgs e)
+        #region Tray Menu Handlers
+        private async void HandleCreateRoomRequest(object? sender, EventArgs e)
         {
             if (isConnected)
             {
-                MessageBox.Show("Connection Already Established", "Uniclip", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show($"Room Already Created with Code {_roomSecretCode}", "Uniclip", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
-
             try
             {
-                string serverUrl = await DiscoverServer();
-                ws = new ClientWebSocket();
-                await ws.ConnectAsync(new Uri(serverUrl), cts.Token);
-                await Send("OPEN:");
-                isConnected = true;
-                StartClipboardWatcher();
-                _ = ReceiveLoop();
+                string serverUrl = await UniclipHelper.DiscoverServer(cts);
+                await ConnectToServer(serverUrl);
             }
             catch (Exception ex)
             {
                 ShowError($"Could not connect automatically. Please enter server address manually.\n\nError: {ex.Message}");
-                ManualServerEntry();
+                await ManualServerEntry();
             }
         }
-
-        private async Task<string> DiscoverServer(string? serverIp = null)
-        {
-            if (string.IsNullOrEmpty(serverIp))
-            {
-                try
-                {
-                    var machineName = Dns.GetHostName();
-                    var uri = new Uri($"http://{machineName}:5000/serverinfo");
-                    using var http = new HttpClient();
-                    var response = await http.GetAsync(uri, cts.Token);
-                    if (response.IsSuccessStatusCode)
-                    {
-                        var json = await response.Content.ReadAsStringAsync();
-                        var ip = System.Text.Json.JsonDocument.Parse(json)
-                            .RootElement.GetProperty("ip").GetString();
-                        return $"ws://{ip}:5000/ws";
-                    }
-                }
-                catch (Exception) { }
-            }
-            else
-            {
-                return $"ws://{serverIp}:5000/ws";
-            }
-            throw new Exception("Server not found automatically");
-        }
-
-        private void ManualServerEntry()
-        {
-            string serverUrl = Microsoft.VisualBasic.Interaction.InputBox(
-                "Enter server IpAddress",
-                "Manual Server Entry",
-                "");
-            serverUrl = DiscoverServer(serverUrl).Result;
-            if (!string.IsNullOrWhiteSpace(serverUrl))
-            {
-                try
-                {
-                    ws = new ClientWebSocket();
-                    ws.ConnectAsync(new Uri(serverUrl), cts.Token).Wait();
-                    Send("OPEN:").Wait();
-                    isConnected = true;
-                    StartClipboardWatcher();
-                    _ = ReceiveLoop();
-                }
-                catch (Exception ex)
-                {
-                    ShowError($"Connection failed: {ex.Message}");
-                }
-            }
-        }
-
-        private async void OnConnect(object sender, EventArgs e)
+        private async void HandleJoinRoomRequest(object? sender, EventArgs e)
         {
             if (isConnected)
             {
-                MessageBox.Show("Device Already connected", "Uniclip", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show($"Device already in Room with code {_roomSecretCode}", "Uniclip", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
@@ -165,7 +87,7 @@ namespace UniclipClient
 
                 if (ws == null || ws.State != WebSocketState.Open)
                 {
-                    string serverUrl = await DiscoverServer(serverIp);
+                    string serverUrl = await UniclipHelper.DiscoverServer(cts, serverIp);
                     ws = new ClientWebSocket();
                     await ws.ConnectAsync(new Uri(serverUrl), cts.Token);
                 }
@@ -180,8 +102,7 @@ namespace UniclipClient
                 ShowError($"Connection failed: {ex.Message}");
             }
         }
-
-        private async void OnCloseConnection(object sender, EventArgs e)
+        private async void HanleCloseRoomRequest(object? sender, EventArgs e)
         {
             isConnected = false;
             clipboardTimer?.Stop();
@@ -200,15 +121,112 @@ namespace UniclipClient
                 ws = null;
             }
         }
-
-        private void OnExit(object sender, EventArgs e)
+        private void HandleExitRequest(object? sender, EventArgs e)
         {
             cts.Cancel();
-            OnCloseConnection(sender, e);
-            trayIcon.Visible = false;
+            HanleCloseRoomRequest(sender, e);
+            if (trayIcon != null)
+                trayIcon.Visible = false;
             Application.Exit();
         }
+        #endregion
 
+
+        #region Message Handlers
+        private void HandleMessage(string message)
+        {
+            if (message.StartsWith("CODE:"))
+            {
+                _roomSecretCode = message[5..];
+                MessageBox.Show($"Your Room Code : {_roomSecretCode}", "Uniclip");
+            }
+            else if (message.StartsWith("CONNECTED"))
+            {
+                trayIcon?.ShowBalloonTip(3000, "Uniclip", "Joined Room Successfully", ToolTipIcon.Info);
+            }
+            else if (message.StartsWith("ERROR:"))
+            {
+                ShowError(message[6..]);
+                isConnected = false;
+                clipboardTimer?.Stop();
+            }
+            else if (message == "DISCONNECTED")
+            {
+                trayIcon?.ShowBalloonTip(3000, "Uniclip", "Lost Room Connectivity", ToolTipIcon.Info);
+                isConnected = false;
+                clipboardTimer?.Stop();
+            }
+            else if (!string.IsNullOrEmpty(message))
+            {
+                isReceiving = true;
+                try
+                {
+                    Clipboard.SetText(message);
+                    lastClipboardText = message;
+                }
+                catch { }
+                isReceiving = false;
+            }
+            else
+            {
+                MessageBox.Show("Something went wrong", "Uniclip", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private static void ShowError(string message)
+        {
+            MessageBox.Show(message, "Uniclip Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        #endregion
+
+
+        #region Private Support Helper
+        private void InitializeTray()
+        {
+            trayMenu = new ContextMenuStrip();
+            trayMenu.Items.Add("CREATE ROOM", UniclipHelper.ConvertBytesTo<Image>(Properties.Resource.CreateRoom), HandleCreateRoomRequest);
+            trayMenu.Items.Add("JOIN ROOM", UniclipHelper.ConvertBytesTo<Image>(Properties.Resource.JoinRoom), HandleJoinRoomRequest);
+            trayMenu.Items.Add("CLOSE ROOM", UniclipHelper.ConvertBytesTo<Image>(Properties.Resource.CloseRoom), HanleCloseRoomRequest);
+            trayMenu.Items.Add("EXIT", UniclipHelper.ConvertBytesTo<Image>(Properties.Resource.Exit), HandleExitRequest);
+            trayMenu.ShowImageMargin = true;
+
+            trayIcon = new NotifyIcon
+            {
+                Text = "Uniclip",
+                Icon = UniclipHelper.ConvertBytesTo<Icon>(Properties.Resource.uniclip),
+                ContextMenuStrip = trayMenu,
+                Visible = true
+            };
+            trayIcon.DoubleClick += (s, e) => MessageBox.Show(isConnected ? "ALREADY IN ROOM" : "AVAILABLE TO JOIN ROOM", "Uniclip", MessageBoxButtons.OK, isConnected ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+            WindowState = FormWindowState.Minimized;
+            ShowInTaskbar = false;
+            Load += (s, e) => Hide();
+        }
+        private async Task ConnectToServer(string serverUrl)
+        {
+            ws = new ClientWebSocket();
+            await ws.ConnectAsync(new Uri(serverUrl), cts.Token);
+            await Send("OPEN:");
+            isConnected = true;
+            StartClipboardWatcher();
+            _ = ReceiveLoop();
+        }
+        private async Task ManualServerEntry()
+        {
+            string serverUrl = Microsoft.VisualBasic.Interaction.InputBox("Enter server IpAddress", "Manual Server Entry", "");
+            serverUrl = await UniclipHelper.DiscoverServer(cts, serverUrl);
+            if (!string.IsNullOrWhiteSpace(serverUrl))
+            {
+                try
+                {
+                    await ConnectToServer(serverUrl);
+                }
+                catch (Exception ex)
+                {
+                    ShowError($"Connection failed: {ex.Message}");
+                }
+            }
+        }
         private void StartClipboardWatcher()
         {
             clipboardTimer = new Timer { Interval = 500 };
@@ -233,6 +251,10 @@ namespace UniclipClient
             clipboardTimer.Start();
         }
 
+        #endregion
+
+
+        #region SOCKET HELPER
         private async Task Send(string message)
         {
             if (ws?.State == WebSocketState.Open)
@@ -281,49 +303,10 @@ namespace UniclipClient
             if (!isConnected)
             {
                 Invoke(new Action(() =>
-                    trayIcon.ShowBalloonTip(3000, "Uniclip", "Disconnected", ToolTipIcon.Info)));
+                    trayIcon?.ShowBalloonTip(3000, "Uniclip", "Lost Room Connectivity", ToolTipIcon.Info)));
             }
         }
 
-        private void HandleMessage(string message)
-        {
-            if (message.StartsWith("CODE:"))
-            {
-                string code = message.Substring(5);
-                MessageBox.Show($"Your Connection Code: {code}", "Uniclip");
-            }
-            else if (message.StartsWith("CONNECTED"))
-            {
-                trayIcon.ShowBalloonTip(3000, "Uniclip", "Devices Connected", ToolTipIcon.Info);
-            }
-            else if (message.StartsWith("ERROR:"))
-            {
-                ShowError(message.Substring(6));
-                isConnected = false;
-                clipboardTimer?.Stop();
-            }
-            else if (message == "DISCONNECTED")
-            {
-                trayIcon.ShowBalloonTip(3000, "Uniclip", "Partner Disconnected", ToolTipIcon.Info);
-                isConnected = false;
-                clipboardTimer?.Stop();
-            }
-            else if (!string.IsNullOrEmpty(message))
-            {
-                isReceiving = true;
-                try
-                {
-                    Clipboard.SetText(message);
-                    lastClipboardText = message;
-                }
-                catch { }
-                isReceiving = false;
-            }
-        }
-
-        private static void ShowError(string message)
-        {
-            MessageBox.Show(message, "Uniclip Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
+        #endregion
     }
 }

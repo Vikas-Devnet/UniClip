@@ -72,7 +72,7 @@ app.Map("/ws", async context =>
             }
             else if (message.StartsWith("JOIN:"))
             {
-                string code = message.Substring(5).Trim();
+                string code = message[5..].Trim();
                 if (pairingCodes.TryRemove(code, out var hostId) &&
                     clients.TryGetValue(hostId, out var hostClient) &&
                     hostClient.partnerId == null)
